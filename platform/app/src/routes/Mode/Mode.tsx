@@ -2,16 +2,19 @@ import React, { useEffect, useState, useRef } from 'react';
 import { useParams, useLocation, useNavigate } from 'react-router';
 import PropTypes from 'prop-types';
 // TODO: DicomMetadataStore should be injected?
-import { DicomMetadataStore, ServicesManager, utils } from '@ohif/core';
+import { DicomMetadataStore, ServicesManager, utils, Types, log } from '@ohif/core';
 import { DragAndDropProvider, ImageViewerProvider } from '@ohif/ui';
 import { useSearchParams } from '@hooks';
+import { useAppConfig } from '@state';
 import ViewportGrid from '@components/ViewportGrid';
 import Compose from './Compose';
 import getStudies from './studiesList';
 import { history } from '../../utils/history';
 import loadModules from '../../pluginImports';
+import isSeriesFilterUsed from '../../utils/isSeriesFilterUsed';
 
-const { getSplitParam } = utils;
+const { getSplitParam, sortingCriteria } = utils;
+const { TimingEnum } = Types;
 
 /**
  * Initialize the route.
@@ -23,45 +26,17 @@ const { getSplitParam } = utils;
  * @returns array of subscriptions to cancel
  */
 function defaultRouteInit(
-  { servicesManager, studyInstanceUIDs, dataSource, filters },
+  { servicesManager, studyInstanceUIDs, dataSource, filters, appConfig },
   hangingProtocolId
 ) {
-  const {
-    displaySetService,
-    hangingProtocolService,
-  } = servicesManager.services;
-
-  const unsubscriptions = [];
-  const {
-    unsubscribe: instanceAddedUnsubscribe,
-  } = DicomMetadataStore.subscribe(
-    DicomMetadataStore.EVENTS.INSTANCES_ADDED,
-    function({ StudyInstanceUID, SeriesInstanceUID, madeInClient = false }) {
-      const seriesMetadata = DicomMetadataStore.getSeries(
-        StudyInstanceUID,
-        SeriesInstanceUID
-      );
-
-      displaySetService.makeDisplaySets(seriesMetadata.instances, madeInClient);
-    }
-  );
-
-  unsubscriptions.push(instanceAddedUnsubscribe);
-
-  const allRetrieves = studyInstanceUIDs.map(StudyInstanceUID =>
-    dataSource.retrieve.series.metadata({
-      StudyInstanceUID,
-      filters,
-    })
-  );
-
-  // The hanging protocol matching service is fairly expensive to run multiple
-  // times, and doesn't allow partial matches to be made (it will simply fail
-  // to display anything if a required match fails), so we wait here until all metadata
-  // is retrieved (which will synchronously trigger the display set creation)
-  // until we run the hanging protocol matching service.
-
-  Promise.allSettled(allRetrieves).then(() => {
+  const { displaySetService, hangingProtocolService, uiNotificationService, customizationService } =
+    servicesManager.services;
+  /**
+   * Function to apply the hanging protocol when the minimum number of display sets were
+   * received or all display sets retrieval were completed
+   * @returns
+   */
+  function applyHangingProtocol() {
     const displaySets = displaySetService.getActiveDisplaySets();
 
     if (!displaySets || !displaySets.length) {
@@ -76,10 +51,88 @@ function defaultRouteInit(
 
     // run the hanging protocol matching on the displaySets with the predefined
     // hanging protocol in the mode configuration
-    hangingProtocolService.run(
-      { studies, activeStudy, displaySets },
-      hangingProtocolId
-    );
+    hangingProtocolService.run({ studies, activeStudy, displaySets }, hangingProtocolId);
+  }
+
+  const unsubscriptions = [];
+  const issuedWarningSeries = [];
+  const { unsubscribe: instanceAddedUnsubscribe } = DicomMetadataStore.subscribe(
+    DicomMetadataStore.EVENTS.INSTANCES_ADDED,
+    function ({ StudyInstanceUID, SeriesInstanceUID, madeInClient = false }) {
+      const seriesMetadata = DicomMetadataStore.getSeries(StudyInstanceUID, SeriesInstanceUID);
+
+      // checks if the series filter was used, if it exists
+      const seriesInstanceUIDs = filters?.seriesInstanceUID;
+      if (
+        seriesInstanceUIDs?.length &&
+        !isSeriesFilterUsed(seriesMetadata.instances, filters) &&
+        !issuedWarningSeries.includes(seriesInstanceUIDs[0])
+      ) {
+        // stores the series instance filter so it shows only once the warning
+        issuedWarningSeries.push(seriesInstanceUIDs[0]);
+        uiNotificationService.show({
+          title: 'Series filter',
+          message: `Each of the series in filter: ${seriesInstanceUIDs} are not part of the current study. The entire study is being displayed`,
+          type: 'error',
+          duration: 7000,
+        });
+      }
+
+      displaySetService.makeDisplaySets(seriesMetadata.instances, madeInClient);
+    }
+  );
+
+  unsubscriptions.push(instanceAddedUnsubscribe);
+
+  log.time(TimingEnum.STUDY_TO_DISPLAY_SETS);
+  log.time(TimingEnum.STUDY_TO_FIRST_IMAGE);
+
+  const allRetrieves = studyInstanceUIDs.map(StudyInstanceUID =>
+    dataSource.retrieve.series.metadata({
+      StudyInstanceUID,
+      filters,
+      returnPromises: true,
+      sortCriteria:
+        customizationService.get('sortingCriteria') ||
+        sortingCriteria.seriesSortCriteria.seriesInfoSortingCriteria,
+    })
+  );
+
+  // log the error if this fails, otherwise it's so difficult to tell what went wrong...
+  allRetrieves.forEach(retrieve => {
+    retrieve.catch(error => {
+      console.error(error);
+    });
+  });
+
+  Promise.allSettled(allRetrieves).then(promises => {
+    log.timeEnd(TimingEnum.STUDY_TO_DISPLAY_SETS);
+    log.time(TimingEnum.DISPLAY_SETS_TO_FIRST_IMAGE);
+    log.time(TimingEnum.DISPLAY_SETS_TO_ALL_IMAGES);
+
+    const allPromises = [];
+    const remainingPromises = [];
+
+    function startRemainingPromises(remainingPromises) {
+      remainingPromises.forEach(p => p.forEach(p => p.start()));
+    }
+
+    promises.forEach(promise => {
+      const retrieveSeriesMetadataPromise = promise.value;
+      if (Array.isArray(retrieveSeriesMetadataPromise)) {
+        const { requiredSeries, remaining } = hangingProtocolService.filterSeriesRequiredForRun(
+          hangingProtocolId,
+          retrieveSeriesMetadataPromise
+        );
+        const requiredSeriesPromises = requiredSeries.map(promise => promise.start());
+        allPromises.push(Promise.allSettled(requiredSeriesPromises));
+        remainingPromises.push(remaining);
+      }
+    });
+
+    Promise.allSettled(allPromises).then(applyHangingProtocol);
+    startRemainingPromises(remainingPromises);
+    applyHangingProtocol();
   });
 
   return unsubscriptions;
@@ -93,6 +146,8 @@ export default function ModeRoute({
   commandsManager,
   hotkeysManager,
 }) {
+  const [appConfig] = useAppConfig();
+
   // Parse route params/querystring
   const location = useLocation();
 
@@ -100,16 +155,22 @@ export default function ModeRoute({
   const params = useParams();
   // The URL's query search parameters where the keys casing is maintained
   const query = useSearchParams();
+
+  mode?.onModeInit?.({
+    servicesManager,
+    extensionManager,
+    commandsManager,
+    appConfig,
+    query,
+  });
+
   // The URL's query search parameters where the keys are all lower case.
   const lowerCaseSearchParams = useSearchParams({ lowerCaseKeys: true });
 
   const [studyInstanceUIDs, setStudyInstanceUIDs] = useState();
 
   const [refresh, setRefresh] = useState(false);
-  const [
-    ExtensionDependenciesLoaded,
-    setExtensionDependenciesLoaded,
-  ] = useState(false);
+  const [ExtensionDependenciesLoaded, setExtensionDependenciesLoaded] = useState(false);
 
   const layoutTemplateData = useRef(false);
   const locationRef = useRef(null);
@@ -123,22 +184,13 @@ export default function ModeRoute({
     locationRef.current = location;
   }
 
-  const {
-    displaySetService,
-    hangingProtocolService,
-    userAuthenticationService,
-  } = (servicesManager as ServicesManager).services;
+  const { displaySetService, hangingProtocolService, userAuthenticationService } = (
+    servicesManager as ServicesManager
+  ).services;
 
-  const {
-    extensions,
-    sopClassHandlers,
-    hotkeys: hotkeyObj,
-    hangingProtocol,
-  } = mode;
+  const { extensions, sopClassHandlers, hotkeys: hotkeyObj, hangingProtocol } = mode;
 
-  const runTimeHangingProtocolId = lowerCaseSearchParams.get(
-    'hangingprotocolid'
-  );
+  const runTimeHangingProtocolId = lowerCaseSearchParams.get('hangingprotocolid');
   const token = lowerCaseSearchParams.get('token');
 
   if (token) {
@@ -151,9 +203,7 @@ export default function ModeRoute({
     });
 
     // Create a URL object with the current location
-    const urlObj = new URL(
-      window.location.origin + location.pathname + location.search
-    );
+    const urlObj = new URL(window.location.origin + location.pathname + location.search);
 
     // Remove the token from the URL object
     urlObj.searchParams.delete('token');
@@ -167,7 +217,7 @@ export default function ModeRoute({
 
   // Preserve the old array interface for hotkeys
   const hotkeys = Array.isArray(hotkeyObj) ? hotkeyObj : hotkeyObj?.hotkeys;
-  const hotkeyName = hotkeyObj?.name || 'hotkey-definitions-v2';
+  const hotkeyName = hotkeyObj?.name || 'hotkey-definitions';
 
   // An undefined dataSourceName implies that the active data source that is already set in the ExtensionManager should be used.
   if (dataSourceName !== undefined) {
@@ -210,9 +260,7 @@ export default function ModeRoute({
       const loadedExtensions = await loadModules(Object.keys(extensions));
       for (const extension of loadedExtensions) {
         const { id: extensionId } = extension;
-        if (
-          extensionManager.registeredExtensionIds.indexOf(extensionId) === -1
-        ) {
+        if (extensionManager.registeredExtensionIds.indexOf(extensionId) === -1) {
           await extensionManager.registerExtension(extension);
         }
       }
@@ -313,6 +361,7 @@ export default function ModeRoute({
         servicesManager,
         extensionManager,
         commandsManager,
+        appConfig,
       });
 
       // use the URL hangingProtocolId if it exists, otherwise use the one
@@ -332,6 +381,7 @@ export default function ModeRoute({
         servicesManager,
         extensionManager,
         commandsManager,
+        appConfig,
       });
 
       /**
@@ -346,24 +396,21 @@ export default function ModeRoute({
        * }
        */
       const filters =
-        Array.from(query.keys()).reduce(
-          (acc: Record<string, string>, val: string) => {
-            const lowerVal = val.toLowerCase();
-            if (lowerVal !== 'studyinstanceuids') {
-              // Not sure why the case matters here - it doesn't in the URL
-              if (lowerVal === 'seriesinstanceuid') {
-                const seriesUIDs = getSplitParam(lowerVal, query);
-                return {
-                  ...acc,
-                  seriesInstanceUID: seriesUIDs,
-                };
-              }
-
-              return { ...acc, [val]: getSplitParam(lowerVal, query) };
+        Array.from(query.keys()).reduce((acc: Record<string, string>, val: string) => {
+          const lowerVal = val.toLowerCase();
+          if (lowerVal !== 'studyinstanceuids') {
+            // Not sure why the case matters here - it doesn't in the URL
+            if (lowerVal === 'seriesinstanceuid') {
+              const seriesUIDs = getSplitParam(lowerVal, query);
+              return {
+                ...acc,
+                seriesInstanceUID: seriesUIDs,
+              };
             }
-          },
-          {}
-        ) ?? {};
+
+            return { ...acc, [val]: getSplitParam(lowerVal, query) };
+          }
+        }, {}) ?? {};
 
       if (route.init) {
         return await route.init(
@@ -385,6 +432,7 @@ export default function ModeRoute({
           studyInstanceUIDs,
           dataSource,
           filters,
+          appConfig,
         },
         hangingProtocolIdToUse
       );
@@ -403,6 +451,7 @@ export default function ModeRoute({
         mode?.onModeExit?.({
           servicesManager,
           extensionManager,
+          appConfig,
         });
       } catch (e) {
         console.warn('mode exit failure', e);
@@ -465,4 +514,5 @@ ModeRoute.propTypes = {
   extensionManager: PropTypes.object,
   servicesManager: PropTypes.object,
   hotkeysManager: PropTypes.object,
+  commandsManager: PropTypes.object,
 };
